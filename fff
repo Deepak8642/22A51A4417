@@ -1,0 +1,785 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║   PDF → EXCEL  DITTO PRINT  —  ULTIMATE FINAL  v2.0                        ║
+║   Azure GPT-4.1 Vision  +  Zero-Loss Rule-Based Fallback                   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+GOAL: "Ditto print" — Excel output that mirrors the PDF as exactly as possible.
+      Every row, every number, every label — exactly where it appears on the page.
+
+ARCHITECTURE:
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Per page, auto-select extraction mode:                      │
+  │                                                              │
+  │  VISION  → Azure GPT-4.1 Vision renders page as image,      │
+  │            AI extracts full table structure with row labels  │
+  │            USE FOR: PA-3, MD-202, scanned/image-heavy PDFs  │
+  │                                                              │
+  │  GRID    → PDF has drawn vertical lines (≥2)                 │
+  │            Use as column boundaries — perfect for IRS forms  │
+  │            USE FOR: f6765, f4797, f8825, f8594, f4797        │
+  │                                                              │
+  │  TABLE   → pdfplumber detects table structure                │
+  │            USE FOR: NY ST-810, MA ST-9, PA EDI schedule      │
+  │                                                              │
+  │  TEXT    → Fallback: cluster chars by x-position            │
+  │            USE FOR: MD-202 page 1 (sparse positioned text)  │
+  └──────────────────────────────────────────────────────────────┘
+
+DITTO PRINT RULES:
+  ✓ Row labels (left column) preserved exactly from AI / text
+  ✓ Numbers preserved as TEXT — never reformatted by Excel
+  ✓ Multi-column forms: each column in correct Excel column
+  ✓ Section headers → dark blue merged row
+  ✓ Sub-headers → light blue row
+  ✓ Values right-aligned, labels left-aligned
+  ✓ Zero-data-loss sub-row overflow for collisions
+  ✓ Blank separator lines preserved
+  ✓ All pages → separate worksheets
+
+INSTALL:
+  pip install pdfplumber openpyxl pillow
+  pip install pymupdf          ← recommended for image rendering
+  -- No openai package needed — uses requests (stdlib+requests) --
+
+AZURE KEY CONFIG  (edit below or set env vars):
+  AZURE_OPENAI_API_KEY     = your key
+  AZURE_OPENAI_ENDPOINT    = https://your-resource.openai.azure.com/
+  AZURE_OPENAI_API_VERSION = 2024-12-01-preview
+  AZURE_OPENAI_MODEL       = gpt-4.1
+
+RUN:
+  python pdf_to_excel_ditto_final.py   input.pdf   [output.xlsx]
+  python pdf_to_excel_ditto_final.py   input.pdf   output.xlsx  --no-ai
+"""
+
+import sys, os, re, json, base64, io
+from collections import defaultdict
+
+import pdfplumber
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+try:
+    import requests as _requests
+    HAS_REQUESTS = True
+except ImportError:
+    import urllib.request as _urllib
+    HAS_REQUESTS = False
+
+try:
+    import fitz
+    HAS_FITZ = True
+except ImportError:
+    HAS_FITZ = False
+
+try:
+    from PIL import Image as PILImage
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AZURE CONFIG  ← edit these or set environment variables
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ── per-page decision thresholds ──────────────────────────────────────────────
+VLINE_MIN         = 2      # ≥ this many PDF v-lines → GRID mode
+TABLE_MIN_COLS    = 2      # pdfplumber table must have ≥ this cols
+AI_THRESHOLD      = 200    # pages with < this many chars → always use Vision AI
+RENDER_DPI        = 180    # image DPI sent to Azure (higher = more accurate)
+RENDER_MAX_W      = 1400   # max image width pixels
+
+# ── cell constants ─────────────────────────────────────────────────────────────
+Y_SNAP    = 2.0
+SEG_GAP   = 7
+COL_SNAP  = 4
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STYLE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def _fill(h):
+    return PatternFill("solid", fgColor=h)
+
+def _side(s="thin", c="CCCCCC"):
+    return Side(style=s, color=c)
+
+def _bdr(s="thin", c="CCCCCC"):
+    sd = _side(s, c)
+    return Border(top=sd, bottom=sd, left=sd, right=sd)
+
+def _fnt(bold=False, sz=9, color="111111"):
+    return Font(name="Arial", bold=bold, size=max(int(sz), 7), color=color)
+
+def _aln(h="left", wrap=True):
+    return Alignment(horizontal=h, vertical="center", wrap_text=wrap)
+
+def _write(cell, value, bold=False, sz=9, fg="111111", bg="FFFFFF",
+           align="left", border=None, wrap=True):
+    cell.value         = str(value) if value is not None else ""
+    cell.number_format = "@"           # force text — never let Excel reformat
+    cell.font          = _fnt(bold=bold, sz=sz, color=fg)
+    cell.fill          = _fill(bg)
+    cell.alignment     = _aln(align, wrap)
+    if border:
+        cell.border    = border
+
+THIN  = _bdr("thin",  "CCCCCC")
+THICK = _bdr("medium","333333")
+
+# Colour palette
+C_WHITE     = "FFFFFF"
+C_STRIPE    = "F5F5F5"
+C_GREY_HDR  = "DCDCDC"
+C_BLUE_HDR  = "2F5496"
+C_BLUE_SUB  = "BDD7EE"
+C_BLACK_HDR = "1F1F1F"
+
+def safe_merge(ws, r1, c1, r2, c2):
+    if r1 == r2 and c1 == c2: return
+    try:
+        ws.merge_cells(start_row=r1, start_column=c1,
+                       end_row=r2, end_column=c2)
+    except Exception:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMAGE RENDERING
+# ══════════════════════════════════════════════════════════════════════════════
+def page_to_b64(pdf_path: str, page_idx: int) -> str | None:
+    """Render PDF page to base64 PNG. Returns None if rendering fails."""
+
+    # PyMuPDF — highest quality
+    if HAS_FITZ:
+        try:
+            doc  = fitz.open(pdf_path)
+            pg   = doc[page_idx]
+            zoom = RENDER_DPI / 72
+            pix  = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            data = pix.tobytes("png")
+            doc.close()
+            return base64.b64encode(data).decode()
+        except Exception as e:
+            print(f"      [fitz render failed: {e}]")
+
+    # pdfplumber + PIL fallback
+    if HAS_PIL:
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                img = pdf.pages[page_idx].to_image(resolution=RENDER_DPI)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                pil = PILImage.open(io.BytesIO(buf.getvalue()))
+                if pil.width > RENDER_MAX_W:
+                    ratio = RENDER_MAX_W / pil.width
+                    pil   = pil.resize(
+                        (RENDER_MAX_W, int(pil.height * ratio)), PILImage.LANCZOS)
+                out = io.BytesIO()
+                pil.save(out, format="PNG")
+                return base64.b64encode(out.getvalue()).decode()
+        except Exception as e:
+            print(f"      [PIL render failed: {e}]")
+
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AZURE GPT-4.1 VISION API CALL (uses requests, no openai SDK needed)
+# ══════════════════════════════════════════════════════════════════════════════
+_VISION_PROMPT = """\
+You are a precision PDF data extraction engine. Your output powers a "ditto print" — \
+an Excel sheet that must be a perfect mirror of this PDF page.
+
+RETURN ONLY valid JSON — no markdown, no explanation, no code fences.
+
+Schema:
+{
+  "columns": ["Label / Description", "Col_2_header", "Col_3_header", ...],
+  "rows": [
+    {"type": "title",     "cells": ["Full title text", "", ""]},
+    {"type": "header",    "cells": ["Section heading", "", ""]},
+    {"type": "subheader", "cells": ["Col A label", "Col B label", "Col C label"]},
+    {"type": "data",      "cells": ["Row label", "value1", "value2"]},
+    {"type": "blank",     "cells": []},
+    {"type": "note",      "cells": ["Footer note text", "", ""]}
+  ]
+}
+
+STRICT RULES — follow ALL of these:
+1. EVERY visible row on the page → one entry in "rows". Nothing skipped.
+2. Row LABELS (left side) go in cells[0] — preserve the full label text.
+3. Numbers preserved EXACTLY as printed: "113,887.45" not 113887.45, ".00" not 0.
+4. Leading-zero numbers like "021000021" → keep as string "021000021".
+5. Multi-column tables: cells list length = columns list length ALWAYS.
+6. "type" values: title / header / subheader / data / blank / note / total / signature
+7. Header rows that span full width → cells[0] = text, remaining cells = "".
+8. Multi-line cell text → use \\n within the string.
+9. Do NOT merge or skip blank rows — include them as type "blank".
+10. Totals rows → type "total" (will be bolded in output).
+11. Signature lines, dates, footnotes → type "signature" or "note".
+12. Preserve the READING ORDER exactly: top to bottom, left to right.
+"""
+
+def call_azure_vision(b64_image: str, raw_text: str) -> dict | None:
+    """Call Azure GPT-4.1 with image. Returns parsed JSON dict or None."""
+    url = (f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_MODEL}"
+           f"/chat/completions?api-version={AZURE_API_VER}")
+
+    headers = {
+        "api-key":      AZURE_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model":       AZURE_MODEL,
+        "max_tokens":  8000,
+        "temperature": 0,
+        "top_p":       1,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text",
+                 "text": _VISION_PROMPT + f"\n\nRaw text reference (may be incomplete):\n{raw_text[:2000]}"},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{b64_image}", "detail": "high"}},
+            ]
+        }]
+    }
+
+    try:
+        if HAS_REQUESTS:
+            import requests
+            r = requests.post(url, headers=headers, json=payload, timeout=90)
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"].strip()
+        else:
+            import urllib.request
+            data = json.dumps(payload).encode()
+            req  = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                content = json.loads(resp.read())["choices"][0]["message"]["content"].strip()
+
+        # Strip any accidental markdown fences
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.S).strip()
+        return json.loads(content)
+
+    except json.JSONDecodeError as e:
+        # Try to extract JSON block
+        m = re.search(r'\{.*\}', content, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group())
+            except Exception:
+                pass
+        print(f"      [AI JSON parse error: {e}]")
+        return None
+    except Exception as e:
+        print(f"      [Azure API error: {e}]")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  WRITE AI-EXTRACTED PAGE TO WORKSHEET
+# ══════════════════════════════════════════════════════════════════════════════
+def write_ai_page(ws, ai_data: dict):
+    """Write AI-structured data to worksheet with ditto-print formatting."""
+    columns = ai_data.get("columns", [])
+    rows    = ai_data.get("rows", [])
+    n_cols  = max(len(columns), 1)
+
+    # Set column widths: first col wider (labels), rest equal
+    ws.column_dimensions["A"].width = 42
+    for ci in range(1, n_cols):
+        ws.column_dimensions[get_column_letter(ci + 1)].width = 18
+
+    xl_row = 1
+
+    # Column header row
+    if columns and any(str(c).strip() for c in columns):
+        for ci, col in enumerate(columns):
+            c = ws.cell(row=xl_row, column=ci + 1)
+            _write(c, col, bold=True, sz=9, fg="FFFFFF", bg=C_BLUE_HDR,
+                   align="center", border=THICK)
+        ws.row_dimensions[xl_row].height = 16
+        xl_row += 1
+
+    for row in rows:
+        rtype = row.get("type", "data")
+        cells = row.get("cells", [])
+
+        # blank row
+        if rtype == "blank" or not cells:
+            ws.row_dimensions[xl_row].height = 6
+            xl_row += 1
+            continue
+
+        # Normalise cells length
+        while len(cells) < n_cols:
+            cells.append("")
+        cells = [str(v) if v is not None else "" for v in cells[:n_cols]]
+
+        ws.row_dimensions[xl_row].height = 14
+
+        # ── title / full-width header ────────────────────────────────────────
+        if rtype in ("title", "header"):
+            c = ws.cell(row=xl_row, column=1)
+            _write(c, cells[0], bold=True, sz=10,
+                   fg="FFFFFF", bg=C_BLACK_HDR,
+                   align="left", border=THICK)
+            ws.row_dimensions[xl_row].height = 15
+            if n_cols > 1:
+                safe_merge(ws, xl_row, 1, xl_row, n_cols)
+
+        # ── sub-header row ───────────────────────────────────────────────────
+        elif rtype == "subheader":
+            for ci, val in enumerate(cells):
+                c = ws.cell(row=xl_row, column=ci + 1)
+                _write(c, val, bold=True, sz=9,
+                       fg="1F3864", bg=C_BLUE_SUB,
+                       align="center", border=THIN)
+            ws.row_dimensions[xl_row].height = 13
+
+        # ── total row ────────────────────────────────────────────────────────
+        elif rtype == "total":
+            for ci, val in enumerate(cells):
+                is_num = ci > 0 and bool(re.match(r'^-?[\d,]+\.?\d*$',
+                                                   val.replace(" ", "")))
+                c = ws.cell(row=xl_row, column=ci + 1)
+                _write(c, val, bold=True, sz=9,
+                       fg="111111", bg="E2EFDA",
+                       align="right" if is_num else "left",
+                       border=THICK)
+
+        # ── note / signature ─────────────────────────────────────────────────
+        elif rtype in ("note", "signature"):
+            c = ws.cell(row=xl_row, column=1)
+            txt = "  ".join(v for v in cells if v.strip())
+            _write(c, txt, bold=False, sz=8,
+                   fg="555555", bg=C_STRIPE,
+                   align="left", border=THIN)
+            ws.row_dimensions[xl_row].height = 12
+            if n_cols > 1:
+                safe_merge(ws, xl_row, 1, xl_row, n_cols)
+
+        # ── normal data row ──────────────────────────────────────────────────
+        else:
+            bg = C_STRIPE if xl_row % 2 == 0 else C_WHITE
+            for ci, val in enumerate(cells):
+                is_num = ci > 0 and bool(re.match(
+                    r'^-?[\d,]+\.?\d*$', val.replace(" ", "")))
+                c = ws.cell(row=xl_row, column=ci + 1)
+                _write(c, val, bold=False, sz=9,
+                       fg="111111", bg=bg,
+                       align="right" if is_num else "left",
+                       border=THIN)
+
+        xl_row += 1
+
+    ws.freeze_panes = "B2"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RULE-BASED HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def snap_vals(vals, tol):
+    out = []
+    for v in sorted(set(round(float(x), 1) for x in vals)):
+        if out and v - out[-1] <= tol:
+            out[-1] = (out[-1] + v) / 2
+        else:
+            out.append(v)
+    return sorted(out)
+
+
+def chars_to_rows(chars, y_snap=Y_SNAP):
+    bkts = defaultdict(list)
+    for ch in chars:
+        key = round(float(ch["top"]) / y_snap) * y_snap
+        bkts[key].append(ch)
+    result = []
+    for k in sorted(bkts):
+        chs = sorted(bkts[k], key=lambda c: float(c["x0"]))
+        result.append((sum(float(c["top"]) for c in chs) / len(chs), chs))
+    return result
+
+
+def chars_to_segs(chs, gap=SEG_GAP):
+    if not chs:
+        return []
+    chs = sorted(chs, key=lambda c: float(c["x0"]))
+    groups = [[chs[0]]]
+    for i in range(1, len(chs)):
+        if float(chs[i]["x0"]) - float(chs[i - 1]["x1"]) > gap:
+            groups.append([])
+        groups[-1].append(chs[i])
+
+    result = []
+    for g in groups:
+        txt = "".join(c["text"] for c in g).strip()
+        if not txt:
+            continue
+        is_dots = all(c["text"].strip() in (".", "", " ") for c in g)
+        if is_dots and result:
+            result[-1]["x1"]   = float(g[-1]["x1"])
+            result[-1]["text"] += " ..."
+            continue
+        result.append(dict(
+            x0   = float(g[0]["x0"]),
+            x1   = float(g[-1]["x1"]),
+            text = txt,
+            bold = any("Bold" in str(c.get("fontname", "")) for c in g),
+            size = float(g[0].get("size") or 9),
+        ))
+    return result
+
+
+def get_fills(page):
+    pw  = float(page.width)
+    out = []
+    for r in page.rects:
+        c = r.get("non_stroking_color")
+        if c is None: continue
+        if isinstance(c, (int, float)): c = (float(c),) * 3
+        if not (isinstance(c, (list, tuple)) and len(c) >= 3): continue
+        r0, g0, b0 = float(c[0]), float(c[1]), float(c[2])
+        if   r0 < 0.2  and g0 < 0.2  and b0 < 0.2:  kind = "black"
+        elif r0 > 0.45 and g0 > 0.45 and b0 > 0.45  \
+             and not (r0 > 0.95 and g0 > 0.95 and b0 > 0.95): kind = "grey"
+        else: continue
+        if float(r["x1"] - r["x0"]) > pw * 0.20:
+            out.append(dict(top=float(r["top"]), bottom=float(r["bottom"]),
+                            kind=kind))
+    return out
+
+
+def fill_at(y, fills, tol=3):
+    for f in fills:
+        if f["top"] - tol <= y <= f["bottom"] + tol:
+            return f["kind"]
+    return None
+
+
+def slot_of(x, slots):
+    best = 0
+    for i in range(len(slots) - 1):
+        if slots[i] - 3 <= x:
+            best = i
+    return best
+
+
+def end_slot_for(si, segs, slots):
+    ci_s = slot_of(segs[si]["x0"], slots)
+    if si + 1 < len(segs):
+        return max(ci_s, slot_of(segs[si + 1]["x0"], slots) - 1)
+    return max(ci_s, slot_of(segs[si]["x1"], slots))
+
+
+def detect_align(seg, sx0, sx1):
+    cw = sx1 - sx0
+    if cw < 5: return "left"
+    mt = (seg["x0"] + seg["x1"]) / 2
+    mc = (sx0 + sx1) / 2
+    if abs(mt - mc) <= cw * 0.22: return "center"
+    if seg["x0"] > sx0 + cw * 0.52: return "right"
+    return "left"
+
+
+def write_rule_line(ws, xl_row, segs, slots, n_slots, fill_kind):
+    """Write one visual line to worksheet with sub-row overflow for zero data loss."""
+    sz = segs[0]["size"] if segs else 9
+    ws.row_dimensions[xl_row].height = max(10, round(sz * 1.65))
+
+    # ── black full-width header ──────────────────────────────────────────────
+    if fill_kind == "black":
+        txt = "  " + "  ".join(s["text"] for s in segs)
+        c   = ws.cell(row=xl_row, column=1, value=txt)
+        c.number_format = "@"
+        c.font          = _fnt(bold=True, sz=max(int(sz), 9), color="FFFFFF")
+        c.fill          = _fill(C_BLACK_HDR)
+        c.alignment     = _aln("left")
+        c.border        = THICK
+        ws.row_dimensions[xl_row].height = 15
+        if n_slots > 1:
+            safe_merge(ws, xl_row, 1, xl_row, n_slots)
+        return 1
+
+    # ── grey header ──────────────────────────────────────────────────────────
+    if fill_kind == "grey":
+        used = set()
+        for si, seg in enumerate(segs):
+            ci_s = slot_of(seg["x0"], slots)
+            ci_e = end_slot_for(si, segs, slots)
+            if ci_s + 1 in used: continue
+            al = detect_align(seg, slots[ci_s], slots[min(ci_s+1, len(slots)-1)])
+            c  = ws.cell(row=xl_row, column=ci_s + 1, value=seg["text"])
+            c.number_format = "@"
+            c.font      = _fnt(bold=True, sz=max(int(seg["size"]), 8))
+            c.fill      = _fill(C_GREY_HDR)
+            c.alignment = _aln(al)
+            c.border    = THIN
+            if ci_e > ci_s:
+                safe_merge(ws, xl_row, ci_s+1, xl_row, ci_e+1)
+                for x in range(ci_s+1, ci_e+2): used.add(x)
+            else:
+                used.add(ci_s + 1)
+        ws.row_dimensions[xl_row].height = 13
+        return 1
+
+    # ── normal row with sub-row overflow ─────────────────────────────────────
+    slot_used = defaultdict(set)   # sub_row → claimed slot numbers
+    placements = []
+
+    for si, seg in enumerate(segs):
+        ci_s = slot_of(seg["x0"], slots)
+        ci_e = end_slot_for(si, segs, slots)
+        sub  = 0
+        while any((ci_s + 1 + k) in slot_used[sub]
+                  for k in range(ci_e - ci_s + 1)):
+            sub += 1
+        placements.append((sub, ci_s, ci_e, seg))
+        for k in range(ci_e - ci_s + 1):
+            slot_used[sub].add(ci_s + 1 + k)
+
+    n_sub = max(p[0] for p in placements) + 1
+    for sub, ci_s, ci_e, seg in placements:
+        row    = xl_row + sub
+        bg     = C_STRIPE if row % 2 == 0 else C_WHITE
+        al     = detect_align(seg, slots[ci_s], slots[min(ci_s+1, len(slots)-1)])
+        c      = ws.cell(row=row, column=ci_s + 1, value=seg["text"])
+        c.number_format = "@"
+        c.font      = _fnt(bold=seg["bold"], sz=max(int(seg["size"]), 8))
+        c.fill      = _fill(bg)
+        c.alignment = _aln(al)
+        c.border    = THIN
+        ws.row_dimensions[row].height = max(10, round(sz * 1.65))
+        if ci_e > ci_s:
+            safe_merge(ws, row, ci_s+1, row, ci_e+1)
+    return n_sub
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RULE-BASED PAGE WRITER  (GRID / TABLE / TEXT)
+# ══════════════════════════════════════════════════════════════════════════════
+def write_rule_page(ws, page):
+    pw        = float(page.width)
+    fills     = get_fills(page)
+    vis_lines = chars_to_rows(page.chars)
+    all_segs  = [chars_to_segs(chs) for _, chs in vis_lines]
+
+    vlines = [l for l in page.lines if abs(l["x0"] - l["x1"]) < 1]
+    tables = [t for t in page.find_tables()
+              if t.extract() and
+              max((len(r) for r in t.extract() if r), default=0) >= TABLE_MIN_COLS]
+
+    # ── choose mode ──────────────────────────────────────────────────────────
+    if len(vlines) >= VLINE_MIN:
+        mode  = "GRID"
+        raw_x = [float(l["x0"]) for l in vlines] + [0.0, pw]
+        slots = snap_vals(raw_x, COL_SNAP)
+    elif tables:
+        mode  = "TABLE"
+        slots = None
+    else:
+        mode  = "TEXT"
+        xs    = {0.0, pw}
+        for segs in all_segs:
+            for s in segs:
+                xs.add(s["x0"])     # x0 only — prevents false slot collisions
+        slots = snap_vals(list(xs), COL_SNAP * 2)
+
+    # ── GRID & TEXT: write via slot system ───────────────────────────────────
+    if mode in ("GRID", "TEXT"):
+        n_slots = max(len(slots) - 1, 1)
+        for ci in range(n_slots):
+            cw = slots[ci + 1] - slots[ci]
+            ws.column_dimensions[get_column_letter(ci + 1)].width = max(3, round(cw / 5.2))
+
+        xl_row = 1
+        for li, (y, chs) in enumerate(vis_lines):
+            segs = all_segs[li]
+            if not segs:
+                ws.row_dimensions[xl_row].height = 6
+                xl_row += 1
+                continue
+            fk     = fill_at(y, fills)
+            xl_row += write_rule_line(ws, xl_row, segs, slots, n_slots, fk)
+
+    # ── TABLE: use pdfplumber table extractor ─────────────────────────────────
+    else:
+        # Build a y-index of table bboxes
+        table_bboxes = [(t.bbox, t.extract()) for t in tables]
+
+        def in_table(y):
+            for (x0, top, x1, bot), _ in table_bboxes:
+                if top - 4 <= y <= bot + 4:
+                    return True
+            return False
+
+        xl_row          = 1
+        processed_tbls  = set()
+
+        for li, (y, chs) in enumerate(vis_lines):
+            # Check if a new table starts near this y
+            for tidx, (bbox, tdata) in enumerate(table_bboxes):
+                _, top, _, bot = bbox
+                if tidx not in processed_tbls and abs(y - top) < 10:
+                    processed_tbls.add(tidx)
+                    if not tdata:
+                        continue
+                    ncols   = max(len(r) for r in tdata if r) if tdata else 1
+                    cw_each = max(3, round((pw / ncols) / 5.2))
+                    for ci in range(ncols):
+                        ltr = get_column_letter(ci + 1)
+                        if ws.column_dimensions[ltr].width < cw_each:
+                            ws.column_dimensions[ltr].width = cw_each
+
+                    is_hdr = True
+                    for trow in tdata:
+                        if trow is None:
+                            xl_row += 1; continue
+                        cells = [str(v).strip() if v else "" for v in trow]
+                        if all(c == "" for c in cells):
+                            xl_row += 1; continue
+                        bg   = C_BLUE_SUB if is_hdr else (C_STRIPE if xl_row%2==0 else C_WHITE)
+                        bold = is_hdr
+                        for ci, val in enumerate(cells):
+                            c = ws.cell(row=xl_row, column=ci + 1)
+                            is_num = not is_hdr and bool(re.match(
+                                r'^-?[\d,]+\.?\d*$', val.replace(" ","")))
+                            _write(c, val, bold=bold, sz=9,
+                                   fg="1F3864" if is_hdr else "111111",
+                                   bg=bg,
+                                   align="right" if is_num else "left",
+                                   border=THIN)
+                        ws.row_dimensions[xl_row].height = 14
+                        xl_row  += 1
+                        is_hdr   = False
+                    continue
+
+            if in_table(y):
+                continue
+
+            # Free-text row outside table
+            segs = all_segs[li]
+            if not segs:
+                xl_row += 1; continue
+            fk = fill_at(y, fills)
+            sz = segs[0]["size"] if segs else 9
+            ws.row_dimensions[xl_row].height = max(10, round(sz * 1.6))
+
+            if fk == "black":
+                txt = "  " + "  ".join(s["text"] for s in segs)
+                c   = ws.cell(row=xl_row, column=1, value=txt)
+                c.number_format = "@"
+                c.font = _fnt(bold=True, sz=max(int(sz),9), color="FFFFFF")
+                c.fill = _fill(C_BLACK_HDR); c.alignment = _aln("left"); c.border = THICK
+                ws.row_dimensions[xl_row].height = 15
+            elif fk == "grey":
+                for ci2, seg in enumerate(segs):
+                    c = ws.cell(row=xl_row, column=ci2 + 1)
+                    _write(c, seg["text"], bold=True, sz=8,
+                           bg=C_GREY_HDR, align="left", border=THIN)
+            else:
+                bg = C_STRIPE if xl_row%2==0 else C_WHITE
+                for seg in segs:
+                    is_right = seg["x0"] > pw * 0.55
+                    col      = max(1, round(seg["x0"] / (pw / 4)))
+                    c        = ws.cell(row=xl_row, column=col)
+                    _write(c, seg["text"], bold=seg["bold"], sz=max(int(seg["size"]),8),
+                           bg=bg, align="right" if is_right else "left",
+                           border=THIN)
+            xl_row += 1
+
+    ws.freeze_panes = "A2"
+    return mode
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN PAGE DISPATCHER
+# ══════════════════════════════════════════════════════════════════════════════
+def process_page(ws, page, pdf_path: str, page_idx: int,
+                 use_ai: bool) -> str:
+    """Auto-select best mode and write page to worksheet."""
+    n_chars  = len(page.chars)
+    n_vlines = len([l for l in page.lines if abs(l["x0"]-l["x1"])<1])
+
+    # Always attempt AI when chars < threshold OR when explicitly requested
+    # AND no clean drawn-line grid exists
+    want_ai  = use_ai and (n_chars < AI_THRESHOLD or
+                           (use_ai and n_vlines < VLINE_MIN))
+
+    if want_ai:
+        b64 = page_to_b64(pdf_path, page_idx)
+        if b64:
+            raw_text = " | ".join(w["text"] for w in (page.extract_words() or []))
+            ai_data  = call_azure_vision(b64, raw_text)
+            if ai_data and "rows" in ai_data:
+                write_ai_page(ws, ai_data)
+                return f"AI-VISION ({len(ai_data['rows'])} rows)"
+            else:
+                print("      [AI failed — falling back to rule-based]")
+
+    mode = write_rule_page(ws, page)
+    return f"RULE-{mode}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+def convert(pdf_path: str, out_path: str = None, use_ai: bool = True):
+    if out_path is None:
+        out_path = os.path.splitext(pdf_path)[0] + "_ditto.xlsx"
+
+    print(f"\n{'═'*64}")
+    print(f"  PDF → Excel  DITTO PRINT  {'(AI ON)' if use_ai else '(AI OFF)'}")
+    print(f"  Input  → {os.path.basename(pdf_path)}")
+    print(f"  Output → {out_path}")
+    if use_ai:
+        print(f"  Azure  → {AZURE_ENDPOINT}  model={AZURE_MODEL}")
+    print(f"{'═'*64}")
+
+    wb = Workbook()
+    with pdfplumber.open(pdf_path) as pdf:
+        n_pages = len(pdf.pages)
+        for pn, page in enumerate(pdf.pages):
+            ws      = wb.active if pn == 0 else wb.create_sheet()
+            ws.title = f"Page {pn+1}"
+            print(f"\n  Page {pn+1}/{n_pages}  "
+                  f"({page.width:.0f}×{page.height:.0f}, {len(page.chars)} chars)…",
+                  end=" ", flush=True)
+            mode = process_page(ws, page, pdf_path, pn, use_ai)
+            print(f"→ [{mode}]  ✓")
+
+    wb.save(out_path)
+    print(f"\n{'═'*64}")
+    print(f"  ✓  {n_pages} page(s) saved → {out_path}")
+    print(f"{'═'*64}\n")
+    return out_path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLI
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser(
+        description="PDF → Excel ditto print (Azure GPT-4.1 Vision + rule-based)")
+    p.add_argument("input",  help="Input PDF")
+    p.add_argument("output", nargs="?", help="Output .xlsx (optional)")
+    p.add_argument("--no-ai", action="store_true",
+                   help="Disable AI, use rule-based only (offline mode)")
+    p.add_argument("--ai-all", action="store_true",
+                   help="Force AI on every page (overrides threshold)")
+    args = p.parse_args()
+
+    if not os.path.exists(args.input):
+        print(f"File not found: {args.input}"); sys.exit(1)
+
+    # --ai-all: lower threshold to 0 so every page uses AI
+    if args.ai_all:
+        AI_THRESHOLD = 0
+
+    convert(args.input, args.output, use_ai=not args.no_ai)
