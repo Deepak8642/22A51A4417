@@ -1,0 +1,557 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║   PDF → EXCEL  ULTIMATE  ·  Azure GPT-4.1 Vision  ·  ilovepdf Quality      ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Uses Azure GPT-4.1 Vision to render each PDF page as an image and extract
+the EXACT visual layout into Excel — same quality as ilovepdf.com.
+
+INSTALL:  pip install pdfplumber openpyxl pillow requests
+RUN:      python pdf_to_excel_ultimate.py  input.pdf  [output.xlsx]
+          python pdf_to_excel_ultimate.py  *.pdf
+
+AZURE CONFIG: Edit the 4 constants below, or set environment variables:
+  AZURE_OPENAI_API_KEY
+  AZURE_OPENAI_ENDPOINT
+  AZURE_OPENAI_API_VERSION
+  AZURE_OPENAI_MODEL
+"""
+
+import sys, os, re, io, json, base64, time, glob
+from collections import defaultdict
+
+import pdfplumber
+from PIL import Image as PILImage
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter, column_index_from_string
+import requests
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AZURE CONFIG  ← edit here or set env vars
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ── rendering settings ────────────────────────────────────────────────────────
+RENDER_DPI      = 200      # higher = more accurate but slower
+IMG_MAX_WIDTH   = 1600     # max pixel width sent to API
+MAX_TOKENS      = 8000     # max tokens in AI response
+AI_TEMPERATURE  = 0        # 0 = deterministic
+
+# ── rule-based fallback settings ─────────────────────────────────────────────
+Y_SNAP    = 1.8
+SEG_GAP   = 6.0
+VLINE_MIN = 2
+LINE_MIN  = 5.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  THE VISION PROMPT
+#  Instructs GPT-4.1 to return structured Excel layout JSON
+# ══════════════════════════════════════════════════════════════════════════════
+VISION_PROMPT = """You are a PDF-to-Excel conversion engine with the same accuracy as ilovepdf.com.
+
+Look at this PDF page image and convert it to Excel with EXACT visual fidelity.
+
+Return ONLY valid JSON — no markdown fences, no explanation.
+
+Schema:
+{
+  "n_cols": <integer — number of columns needed to represent this page>,
+  "col_widths": [<float>, ...],  // n_cols values, in Excel character units (total ≈ 140-180 for A4)
+  "rows": [
+    {
+      "height": <float>,  // row height in points (typical data row = 12.8)
+      "cells": [
+        {
+          "c1": <1-based start col>,
+          "c2": <1-based end col>,   // same as c1 if no merge
+          "value": "<cell text>",    // use \\n for line breaks within cell
+          "bold": <true|false>,
+          "size": <font size float, default 10>,
+          "align": "<left|center|right>",
+          "wrap": <true|false>
+        }
+      ]
+    }
+  ]
+}
+
+CRITICAL RULES — follow ALL of these:
+1. PRESERVE EVERY PIECE OF TEXT — nothing can be omitted.
+2. Map x-positions → columns proportionally. Wider content blocks need more columns.
+3. Map y-positions → rows. Content at same y-level belongs in the same row.
+4. Content that visually spans multiple columns → c1 and c2 define the merge range.
+5. Multi-line content in one visual block → single cell with \\n separating lines.
+6. PRESERVE NUMBERS EXACTLY: "85,994" not 85994, "1 4 2 1 2 1" stays as-is.
+7. Preserve spacing characters (use spaces or \\xa0 as needed for alignment).
+8. Empty rows between sections → include as rows with height=6 and empty cells=[].
+9. Each row's cells must not overlap column ranges within that row.
+10. Numbers separated by spaces (like "2 3 6 8 6 8") stay exactly as printed.
+11. Section headers that span full width → c1=1, c2=n_cols.
+12. col_widths must sum to approximately the same as ilovepdf (total ≈ 140-180).
+13. For forms with checkbox-style content, preserve the checkbox symbol and label.
+14. Right-aligned numbers stay right-aligned (align="right").
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMAGE RENDERING
+# ══════════════════════════════════════════════════════════════════════════════
+def render_page_to_b64(pdf_path: str, page_idx: int) -> str:
+    """Render PDF page to base64 PNG using pdfplumber + PIL."""
+    with pdfplumber.open(pdf_path) as pdf:
+        pg = pdf.pages[page_idx]
+        img_obj = pg.to_image(resolution=RENDER_DPI)
+        buf = io.BytesIO()
+        img_obj.save(buf, format="PNG")
+        pil = PILImage.open(io.BytesIO(buf.getvalue()))
+
+    # Resize if too wide
+    if pil.width > IMG_MAX_WIDTH:
+        ratio = IMG_MAX_WIDTH / pil.width
+        new_h = int(pil.height * ratio)
+        pil = pil.resize((IMG_MAX_WIDTH, new_h), PILImage.LANCZOS)
+
+    out = io.BytesIO()
+    pil.save(out, format="PNG", optimize=True)
+    return base64.b64encode(out.getvalue()).decode()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AZURE GPT-4.1 VISION API CALL
+# ══════════════════════════════════════════════════════════════════════════════
+def call_azure_vision(b64_image: str, raw_text_hint: str = "") -> dict | None:
+    """Call Azure GPT-4.1 Vision and return parsed JSON layout."""
+    url = (f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_MODEL}"
+           f"/chat/completions?api-version={AZURE_API_VER}")
+    headers = {"api-key": AZURE_API_KEY, "Content-Type": "application/json"}
+
+    extra = ""
+    if raw_text_hint:
+        extra = f"\n\nReference text from PDF (use to verify content accuracy):\n{raw_text_hint[:1500]}"
+
+    payload = {
+        "model":       AZURE_MODEL,
+        "max_tokens":  MAX_TOKENS,
+        "temperature": AI_TEMPERATURE,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text",
+                 "text": VISION_PROMPT + extra},
+                {"type": "image_url",
+                 "image_url": {
+                     "url":    f"data:image/png;base64,{b64_image}",
+                     "detail": "high"
+                 }}
+            ]
+        }]
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=120)
+        r.raise_for_status()
+        content = r.json()["choices"][0]["message"]["content"].strip()
+        # Strip markdown fences if present
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.S).strip()
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        # Try to extract JSON block
+        m = re.search(r'\{[\s\S]*\}', content)
+        if m:
+            try:
+                return json.loads(m.group())
+            except Exception:
+                pass
+        print(f"      [JSON parse error: {e}]")
+        print(f"      [Raw response start: {content[:200]}]")
+        return None
+    except Exception as e:
+        print(f"      [Azure error: {e}]")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXCEL WRITER FROM AI JSON
+# ══════════════════════════════════════════════════════════════════════════════
+def _side(s="thin", c="000000"): return Side(style=s, color=c)
+def _bfull():
+    s=_side(); return Border(top=s,bottom=s,left=s,right=s)
+def _bnone(): return Border()
+def _fnone(): return PatternFill(fill_type=None)
+def _fnt(bold=False, sz=10, color="000000"):
+    return Font(name="Calibri", bold=bold, size=max(int(sz), 7), color=color)
+def _aln(h="left", wrap=True):
+    return Alignment(horizontal=h, vertical="center", wrap_text=wrap)
+
+def safe_merge(ws, r1, c1, r2, c2):
+    if r1 == r2 and c1 == c2: return
+    try: ws.merge_cells(start_row=r1,start_column=c1,end_row=r2,end_column=c2)
+    except Exception: pass
+
+def write_ai_layout(ws, layout: dict):
+    """Write the AI-returned layout to the worksheet."""
+    n_cols     = layout.get("n_cols", 10)
+    col_widths = layout.get("col_widths", [])
+    rows       = layout.get("rows", [])
+
+    # Set column widths
+    for ci, w in enumerate(col_widths[:n_cols], 1):
+        ws.column_dimensions[get_column_letter(ci)].width = max(1.0, float(w))
+    # Fill remaining columns with default width
+    for ci in range(len(col_widths) + 1, n_cols + 1):
+        ws.column_dimensions[get_column_letter(ci)].width = 5.0
+
+    xl_row = 1
+    for row_data in rows:
+        h     = row_data.get("height", 12.8)
+        cells = row_data.get("cells", [])
+        ws.row_dimensions[xl_row].height = float(h)
+
+        for cell_data in cells:
+            c1    = int(cell_data.get("c1", 1))
+            c2    = int(cell_data.get("c2", c1))
+            val   = cell_data.get("value", "")
+            bold  = bool(cell_data.get("bold", False))
+            sz    = float(cell_data.get("size", 10))
+            align = str(cell_data.get("align", "left"))
+            wrap  = bool(cell_data.get("wrap", True))
+
+            # Clamp to valid range
+            c1 = max(1, min(c1, n_cols))
+            c2 = max(c1, min(c2, n_cols))
+
+            cell = ws.cell(row=xl_row, column=c1)
+            cell.value         = str(val) if val is not None else ""
+            cell.number_format = "@"
+            cell.font          = _fnt(bold=bold, sz=sz)
+            cell.fill          = _fnone()
+            cell.alignment     = _aln(align, wrap=wrap)
+            cell.border        = _bnone()
+
+            if c2 > c1:
+                safe_merge(ws, xl_row, c1, xl_row, c2)
+
+        xl_row += 1
+
+    ws.freeze_panes = "A2"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RULE-BASED FALLBACK ENGINE
+#  Used when Azure is unavailable or returns bad data
+# ══════════════════════════════════════════════════════════════════════════════
+def _get_rows(chars):
+    b = defaultdict(list)
+    for c in chars: b[round(float(c["top"])/Y_SNAP)*Y_SNAP].append(c)
+    return [(sum(float(c["top"]) for c in v)/len(v),
+             sorted(v, key=lambda c: float(c["x0"])))
+            for k in sorted(b) for v in [b[k]]]
+
+def _get_segs(chs):
+    if not chs: return []
+    chs = sorted(chs, key=lambda c: float(c["x0"]))
+    groups = [[chs[0]]]
+    for i in range(1,len(chs)):
+        if float(chs[i]["x0"])-float(chs[i-1]["x1"])>SEG_GAP: groups.append([])
+        groups[-1].append(chs[i])
+    result = []
+    for g in groups:
+        txt = "".join(c["text"] for c in g).strip()
+        if not txt: continue
+        if all(c in ". " for c in txt) and result:
+            result[-1]["x1"]=float(g[-1]["x1"]); continue
+        result.append(dict(x0=float(g[0]["x0"]),x1=float(g[-1]["x1"]),text=txt,
+                           bold=any("Bold" in str(c.get("fontname","")) for c in g),
+                           size=float(g[0].get("size") or 9)))
+    return result
+
+def _snap(vals, tol):
+    out=[]
+    for v in sorted(set(round(float(x),2) for x in vals)):
+        if out and v-out[-1]<=tol: out[-1]=(out[-1]+v)/2
+        else: out.append(v)
+    return sorted(out)
+
+def _slot(x, slots):
+    best=0
+    for i in range(len(slots)-1):
+        if slots[i]-3<=x: best=i
+    return best
+
+def _end_slot(si, segs, slots):
+    cs = _slot(segs[si]["x0"], slots)
+    if si+1<len(segs): return max(cs, _slot(segs[si+1]["x0"],slots)-1)
+    return max(cs, _slot(segs[si]["x1"],slots))
+
+def _get_fills(page):
+    pw=float(page.width); out=[]
+    for r in page.rects:
+        c=r.get("non_stroking_color")
+        if c is None: continue
+        if isinstance(c,(int,float)): c=(float(c),)*3
+        if not(isinstance(c,(list,tuple)) and len(c)>=3): continue
+        r0,g0,b0=float(c[0]),float(c[1]),float(c[2])
+        if   r0<0.2  and g0<0.2  and b0<0.2:  kind="black"
+        elif r0>0.4  and g0>0.4  and b0>0.4  and not(r0>0.94 and g0>0.94 and b0>0.94): kind="grey"
+        else: continue
+        if float(r["x1"]-r["x0"])>pw*0.18:
+            out.append(dict(top=float(r["top"]),bottom=float(r["bottom"]),kind=kind))
+    return out
+
+def _fill_at(y, fills, tol=4):
+    for f in fills:
+        if f["top"]-tol<=y<=f["bottom"]+tol: return f["kind"]
+    return None
+
+def _write_line_rb(ws, xl_row, segs, slots, n_slots, fk, sz):
+    """Rule-based: write one row of segments."""
+    if fk == "black":
+        txt = "  " + "  ".join(s["text"] for s in segs)
+        c = ws.cell(xl_row, 1)
+        c.value=txt; c.number_format="@"
+        c.font=_fnt(bold=True,sz=max(int(sz),9),color="FFFFFF")
+        c.fill=PatternFill("solid",fgColor="1F1F1F"); c.alignment=_aln("left")
+        ws.row_dimensions[xl_row].height=max(14,round(sz*1.6))
+        if n_slots>1: safe_merge(ws,xl_row,1,xl_row,n_slots)
+        return 1
+    if fk == "grey":
+        used=set()
+        for si,seg in enumerate(segs):
+            cs=_slot(seg["x0"],slots); ce=_end_slot(si,segs,slots); col=cs+1
+            if col in used: continue
+            c=ws.cell(xl_row,col); c.value=seg["text"]; c.number_format="@"
+            c.font=_fnt(bold=True,sz=max(int(seg["size"]),8))
+            c.fill=PatternFill("solid",fgColor="DCDCDC"); c.alignment=_aln("left")
+            if ce>cs: safe_merge(ws,xl_row,col,xl_row,ce+1); [used.add(x) for x in range(col,ce+2)]
+            else: used.add(col)
+        ws.row_dimensions[xl_row].height=13; return 1
+
+    ws.row_dimensions[xl_row].height=max(11,round(sz*1.65))
+    su=defaultdict(set); pl=[]
+    for si,seg in enumerate(segs):
+        cs=_slot(seg["x0"],slots); ce=_end_slot(si,segs,slots); sub=0
+        while any((cs+1+k) in su[sub] for k in range(ce-cs+1)): sub+=1
+        pl.append((sub,cs,ce,seg))
+        for k in range(ce-cs+1): su[sub].add(cs+1+k)
+    ns=max(p[0] for p in pl)+1
+    for sub,cs,ce,seg in pl:
+        r=xl_row+sub; c=ws.cell(r,cs+1)
+        c.value=seg["text"]; c.number_format="@"
+        c.font=_fnt(bold=seg["bold"],sz=max(int(seg["size"]),8)); c.alignment=_aln("left")
+        ws.row_dimensions[r].height=max(11,round(sz*1.65))
+        if ce>cs: safe_merge(ws,r,cs+1,r,ce+1)
+    return ns
+
+def write_rule_based(ws, page):
+    """Rule-based fallback: GRID, TABLE, or TEXT mode."""
+    pw    = float(page.width)
+    fills = _get_fills(page)
+    vis   = _get_rows(page.chars)
+    segs_all = [_get_segs(chs) for _,chs in vis]
+
+    vlines = [l for l in page.lines if abs(l["x0"]-l["x1"])<1.5 and abs(l["y0"]-l["y1"])>LINE_MIN]
+    tables = [t for t in page.find_tables()
+              if t.extract() and max((len(r) for r in t.extract() if r),default=0)>=2]
+
+    if len(vlines) >= VLINE_MIN:
+        xs = [float(l["x0"]) for l in vlines]+[0.0,pw]
+        slots = _snap(xs, 4)
+    elif tables:
+        # Table mode
+        spans = [(t.bbox[1],t.bbox[3],t) for t in tables]
+        xl=1; done=set()
+        for li,(y,_) in enumerate(vis):
+            for ti,(tp,bt,t) in enumerate(spans):
+                if ti not in done and abs(y-tp)<12:
+                    done.add(ti); data=t.extract()
+                    if not data: continue
+                    nc=max((len(r) for r in data if r),default=1)
+                    tw=t.bbox[2]-t.bbox[0]
+                    for ci in range(nc):
+                        ltr=get_column_letter(ci+1)
+                        cw=max(4,round((tw/nc)/5.5))
+                        if ws.column_dimensions[ltr].width<cw: ws.column_dimensions[ltr].width=cw
+                    hdr=True
+                    for trow in data:
+                        if trow is None: xl+=1; continue
+                        cells=[str(v).strip() if v is not None else "" for v in trow]
+                        if all(c=="" for c in cells): xl+=1; continue
+                        ws.row_dimensions[xl].height=14
+                        for ci,val in enumerate(cells):
+                            c=ws.cell(xl,ci+1); c.value=val; c.number_format="@"
+                            c.font=_fnt(bold=hdr,sz=9)
+                            c.alignment=_aln("center" if hdr else ("right" if re.match(r'^-?[\d,]+\.?\d*$',val.replace(" ","")) else "left"))
+                        hdr=False; xl+=1
+                    continue
+            if any(t.bbox[1]-5<=y<=t.bbox[3]+5 for _,_,t in spans): continue
+            segs=segs_all[li]
+            if not segs: xl+=1; continue
+            sz=segs[0]["size"]; fk=_fill_at(y,fills)
+            ws.row_dimensions[xl].height=max(11,round(sz*1.6))
+            if fk=="black":
+                c=ws.cell(xl,1); c.value="  "+"  ".join(s["text"] for s in segs); c.number_format="@"
+                c.font=_fnt(bold=True,sz=max(int(sz),9),color="FFFFFF")
+                c.fill=PatternFill("solid",fgColor="1F1F1F"); ws.row_dimensions[xl].height=14
+            else:
+                for seg in segs:
+                    col=max(1,round(seg["x0"]/(pw/6)))
+                    c=ws.cell(xl,col); c.value=seg["text"]; c.number_format="@"
+                    c.font=_fnt(bold=seg["bold"],sz=max(int(seg["size"]),8))
+                    c.alignment=_aln("right" if seg["x0"]>pw*0.55 else "left",wrap=False)
+            xl+=1
+        ws.freeze_panes="A2"; return "TABLE"
+    else:
+        xs={0.0,pw}
+        for segs in segs_all:
+            for s in segs: xs.add(s["x0"])
+        slots = _snap(list(xs), 6)
+
+    n=max(len(slots)-1,1)
+    for ci in range(n):
+        cw=(slots[ci+1]-slots[ci])/5.5
+        ws.column_dimensions[get_column_letter(ci+1)].width=max(3.5,cw)
+
+    xl=1
+    for li,(y,_) in enumerate(vis):
+        segs=segs_all[li]; fk=_fill_at(y,fills)
+        if not segs: ws.row_dimensions[xl].height=5; xl+=1; continue
+        sz=segs[0]["size"]
+        xl+=_write_line_rb(ws,xl,segs,slots,n,fk,sz)
+    ws.freeze_panes="A2"
+    return "GRID" if len(vlines)>=VLINE_MIN else "TEXT"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN PAGE PROCESSOR
+# ══════════════════════════════════════════════════════════════════════════════
+def process_page(ws, page, pdf_path: str, page_idx: int, use_ai: bool) -> str:
+    """Process one page: AI vision or rule-based fallback."""
+
+    if use_ai:
+        # Get raw text as hint for AI
+        raw_words = page.extract_words() or []
+        raw_text = " | ".join(w["text"] for w in raw_words[:200])
+
+        try:
+            b64 = render_page_to_b64(pdf_path, page_idx)
+            layout = call_azure_vision(b64, raw_text)
+
+            if layout and "rows" in layout and len(layout["rows"]) > 0:
+                write_ai_layout(ws, layout)
+                return f"AI-VISION ({len(layout['rows'])} rows)"
+            else:
+                print("      [AI returned empty layout — using rule-based]")
+        except Exception as e:
+            print(f"      [AI error: {e} — using rule-based]")
+
+    # Rule-based fallback
+    mode = write_rule_based(ws, page)
+    return f"RULE-{mode}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONVERT
+# ══════════════════════════════════════════════════════════════════════════════
+def convert(pdf_path: str, out_path: str = None, use_ai: bool = True) -> str:
+    """
+    Convert a PDF to Excel with ilovepdf-quality accuracy.
+
+    Args:
+        pdf_path : Path to the input PDF.
+        out_path : Output .xlsx path (auto-named if None).
+        use_ai   : Use Azure Vision (True) or rule-based only (False).
+
+    Returns:
+        Path of the created .xlsx file.
+    """
+    if out_path is None:
+        out_path = os.path.splitext(pdf_path)[0] + ".xlsx"
+
+    mode_tag = "Azure GPT-4.1 Vision" if use_ai else "Rule-Based"
+    print(f"\n{'═'*62}")
+    print(f"  PDF → Excel  [{mode_tag}]")
+    print(f"  Input  : {os.path.basename(pdf_path)}")
+    print(f"  Output : {out_path}")
+    if use_ai:
+        print(f"  Azure  : {AZURE_ENDPOINT}  model={AZURE_MODEL}")
+    print(f"{'═'*62}")
+
+    wb = Workbook()
+
+    with pdfplumber.open(pdf_path) as pdf:
+        n_pages = len(pdf.pages)
+        for pn, page in enumerate(pdf.pages):
+            ws       = wb.active if pn == 0 else wb.create_sheet()
+            ws.title = f"Page {pn + 1}"
+
+            n_chars  = len(page.chars)
+            n_vlines = len([l for l in page.lines
+                            if abs(l["x0"]-l["x1"])<1.5 and abs(l["y0"]-l["y1"])>LINE_MIN])
+
+            print(f"\n  Page {pn+1}/{n_pages}  "
+                  f"({page.width:.0f}×{page.height:.0f}  "
+                  f"chars={n_chars}  vlines={n_vlines})...",
+                  end="  ", flush=True)
+
+            mode = process_page(ws, page, pdf_path, pn, use_ai)
+            print(f"[{mode}] ✓")
+
+            # Gentle rate limiting
+            if use_ai and pn < n_pages - 1:
+                time.sleep(0.5)
+
+    wb.save(out_path)
+    print(f"\n{'═'*62}")
+    print(f"  ✓  {n_pages} page(s) saved  →  {out_path}")
+    print(f"{'═'*62}\n")
+    return out_path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLI
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description="PDF → Excel with Azure GPT-4.1 Vision (ilovepdf quality)")
+    p.add_argument("inputs", nargs="+",
+                   help="PDF file(s) or glob patterns (e.g. *.pdf)")
+    p.add_argument("-o", "--output",
+                   help="Output .xlsx path (only used when converting single file)")
+    p.add_argument("--no-ai", action="store_true",
+                   help="Skip Azure AI — use rule-based extraction only (offline)")
+    args = p.parse_args()
+
+    # Expand globs
+    pdf_files = []
+    for pat in args.inputs:
+        expanded = glob.glob(pat)
+        if expanded:
+            pdf_files.extend(sorted(expanded))
+        elif os.path.exists(pat):
+            pdf_files.append(pat)
+        else:
+            print(f"  [WARN] Not found: {pat}")
+
+    if not pdf_files:
+        print("No PDF files found."); sys.exit(1)
+
+    out = args.output if (args.output and len(pdf_files) == 1) else None
+    use_ai = not args.no_ai
+
+    ok = fail = 0
+    for pdf_path in pdf_files:
+        try:
+            dest = out if len(pdf_files) == 1 else None
+            convert(pdf_path, dest, use_ai=use_ai)
+            ok += 1
+        except Exception as e:
+            print(f"\n  [ERROR] {pdf_path}: {e}")
+            import traceback; traceback.print_exc()
+            fail += 1
+
+    if len(pdf_files) > 1:
+        print(f"\n  Summary: {ok} converted, {fail} failed.\n")
