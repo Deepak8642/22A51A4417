@@ -1,345 +1,332 @@
 """
-PDF → Excel Converter
-=====================
-• Preserves text alignment (left / center / right) by analyzing word x-positions
-• Reproduces tables with full formatting (headers, alternating rows, borders)
-• Extracts and places images at their accurate PDF coordinates
-• Each PDF page → one Excel sheet
+PDF → Excel  DYNAMIC CONVERTER  —  Works on ANY PDF
+====================================================
+No hardcoding. No API. 100% offline.
+Replicates ilovepdf.com quality for any PDF type.
 
-Usage:
-    python pdf_to_excel.py input.pdf output.xlsx
+MODES (auto-selected per page):
+  GRID  — PDF has drawn vertical lines → exact column positions
+  TABLE — pdfplumber detects structured tables
+  TEXT  — Free-form text → cluster by x-position
+
+pip install pdfplumber openpyxl
+python pdf_to_excel.py  input.pdf  [output.xlsx]
 """
-
-import sys, os, io, re, subprocess
+import sys, os, re, glob
 from collections import defaultdict
-
 import pdfplumber
-from pdf2image import convert_from_path
-from PIL import Image as PILImage
 from openpyxl import Workbook
-from openpyxl.styles import (Font, PatternFill, Alignment,
-                              Border, Side, GradientFill)
-from openpyxl.drawing.image import Image as XLImage
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-EXCEL_COLS   = 16          # number of columns to map page width into
-ROW_HEIGHT   = 15          # default Excel row height (pts)
-IMG_DIR      = "/tmp/pdf_conv_images"
-os.makedirs(IMG_DIR, exist_ok=True)
+# ── constants ─────────────────────────────────────────────────────────────────
+Y_SNAP    = 1.8
+SEG_GAP   = 6.0
+VLINE_MIN = 2
+TABLE_COLS= 2
+LINE_MIN  = 5.0
 
-# ── Colour palette ─────────────────────────────────────────────────────────────
-C_HEADER_BG  = "1F3864"
-C_HEADER_FG  = "FFFFFF"
-C_TOTAL_BG   = "2F5597"
-C_TOTAL_FG   = "FFFFFF"
-C_ROW_EVEN   = "EBF3FB"
-C_ROW_ODD    = "FFFFFF"
-C_TITLE_FG   = "1F3864"
-C_TITLE_BG   = "DCE6F1"
-C_HEADING_FG = "2F5597"
+# ── styles ────────────────────────────────────────────────────────────────────
+def _sd(s="thin",c="000000"): return Side(style=s,color=c)
+def _bfull():
+    s=_sd(); return Border(top=s,bottom=s,left=s,right=s)
+def _bnone(): return Border()
+def _fnone(): return PatternFill(fill_type=None)
+def _fill(rgb): return PatternFill("solid",fgColor=rgb)
+def _fnt(bold=False,sz=9,color="000000"):
+    return Font(name="Calibri",bold=bold,size=max(int(sz),7),color=color)
+def _aln(h="left",wrap=True):
+    return Alignment(horizontal=h,vertical="center",wrap_text=wrap)
 
-def solid(hex_color):
-    return PatternFill("solid", fgColor=hex_color)
+def wc(cell,val,bold=False,sz=9,align="left",wrap=True,border=True,fill=None,color="000000"):
+    cell.value=str(val) if val is not None else ""
+    cell.number_format="@"
+    cell.font=_fnt(bold=bold,sz=sz,color=color)
+    cell.fill=_fill(fill) if fill else _fnone()
+    cell.alignment=_aln(align,wrap=wrap)
+    cell.border=_bfull() if border else _bnone()
 
-THIN = Side(style="thin",   color="BBBBBB")
-MED  = Side(style="medium", color="2F5597")
-NO   = Side(style=None)
+def mg(ws,r1,c1,r2,c2):
+    if r1==r2 and c1==c2: return
+    try: ws.merge_cells(start_row=r1,start_column=c1,end_row=r2,end_column=c2)
+    except: pass
 
-def cell_border(top=THIN, bottom=THIN, left=THIN, right=THIN):
-    return Border(top=top, bottom=bottom, left=left, right=right)
+def set_cws(ws,slots):
+    for ci in range(len(slots)-1):
+        w=(slots[ci+1]-slots[ci])/5.5
+        ws.column_dimensions[get_column_letter(ci+1)].width=max(3.5,w)
 
-# ── Alignment detection ────────────────────────────────────────────────────────
-def detect_alignment(words, page_width, margin_frac=0.08):
-    """
-    Given a list of pdfplumber word dicts on ONE line, decide
-    whether the line is LEFT / CENTER / RIGHT aligned.
+def rh(ws,r,h): ws.row_dimensions[r].height=h
 
-    Strategy:
-      - Compute the line's x-span [x_min .. x_max]
-      - Compute how far the text midpoint is from the page midpoint
-      - If midpoint is within ±10% of page centre → CENTER
-      - If text starts past 55% of page width            → RIGHT
-      - Otherwise                                         → LEFT
-    """
-    if not words:
-        return "left"
+# ── pdf parsing ───────────────────────────────────────────────────────────────
+def get_rows(chars,y_snap=Y_SNAP):
+    b=defaultdict(list)
+    for c in chars: b[round(float(c["top"])/y_snap)*y_snap].append(c)
+    return [(sum(float(c["top"]) for c in v)/len(v),
+             sorted(v,key=lambda c:float(c["x0"])))
+            for k in sorted(b) for v in [b[k]]]
 
-    x_min   = min(float(w["x0"]) for w in words)
-    x_max   = max(float(w["x1"]) for w in words)
-    mid_txt = (x_min + x_max) / 2
-    mid_pg  = page_width / 2
-    margin  = page_width * margin_frac
+def get_segs(chs,gap=SEG_GAP):
+    if not chs: return []
+    chs=sorted(chs,key=lambda c:float(c["x0"]))
+    groups=[[chs[0]]]
+    for i in range(1,len(chs)):
+        if float(chs[i]["x0"])-float(chs[i-1]["x1"])>gap: groups.append([])
+        groups[-1].append(chs[i])
+    result=[]
+    for g in groups:
+        txt="".join(c["text"] for c in g).strip()
+        if not txt: continue
+        if all(c in ". " for c in txt) and result:
+            result[-1]["x1"]=float(g[-1]["x1"]); continue
+        result.append(dict(x0=float(g[0]["x0"]),x1=float(g[-1]["x1"]),
+            text=txt,bold=any("Bold" in str(c.get("fontname","")) or
+            "bold" in str(c.get("fontname","")).lower() for c in g),
+            size=float(g[0].get("size") or 9)))
+    return result
 
-    if abs(mid_txt - mid_pg) <= margin:
-        return "center"
-    if x_min > page_width * 0.55:
-        return "right"
+def snap(vals,tol):
+    out=[]
+    for v in sorted(set(round(float(x),2) for x in vals)):
+        if out and v-out[-1]<=tol: out[-1]=(out[-1]+v)/2
+        else: out.append(v)
+    return sorted(out)
+
+def vline_slots(page):
+    xs=[float(l["x0"]) for l in page.lines
+        if abs(l["x0"]-l["x1"])<1.5 and abs(l["y0"]-l["y1"])>LINE_MIN]
+    xs+=[0.0,float(page.width)]
+    return snap(xs,4)
+
+def text_slots(all_segs,pw):
+    xs={0.0,float(pw)}
+    for segs in all_segs:
+        for s in segs: xs.add(s["x0"])
+    return snap(list(xs),6)
+
+def slot_of(x,slots):
+    best=0
+    for i in range(len(slots)-1):
+        if slots[i]-3<=x: best=i
+    return best
+
+def end_slot(si,segs,slots):
+    cs=slot_of(segs[si]["x0"],slots)
+    if si+1<len(segs): return max(cs,slot_of(segs[si+1]["x0"],slots)-1)
+    return max(cs,slot_of(segs[si]["x1"],slots))
+
+def detect_align(seg,sx0,sx1):
+    cw=sx1-sx0
+    if cw<5: return "left"
+    if abs((seg["x0"]+seg["x1"])/2-(sx0+sx1)/2)<=cw*0.22: return "center"
+    if seg["x0"]>sx0+cw*0.52: return "right"
     return "left"
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def in_any_table(y, table_bboxes, tol=2):
-    for (x0, top, x1, bot) in table_bboxes:
-        if top - tol <= y <= bot + tol:
-            return True
-    return False
+def get_fills(page):
+    pw=float(page.width); out=[]
+    for r in page.rects:
+        c=r.get("non_stroking_color")
+        if c is None: continue
+        if isinstance(c,(int,float)): c=(float(c),)*3
+        if not(isinstance(c,(list,tuple)) and len(c)>=3): continue
+        r0,g0,b0=float(c[0]),float(c[1]),float(c[2])
+        if   r0<0.20 and g0<0.20 and b0<0.20: kind="black"
+        elif r0>0.40 and g0>0.40 and b0>0.40 and not(r0>0.94 and g0>0.94 and b0>0.94): kind="grey"
+        else: continue
+        if float(r["x1"]-r["x0"])>pw*0.18:
+            out.append(dict(top=float(r["top"]),bottom=float(r["bottom"]),kind=kind))
+    return out
 
-def font_size_of_words(words):
-    sizes = [float(w.get("size") or 10) for w in words if w.get("size")]
-    return sum(sizes) / len(sizes) if sizes else 10
+def fill_at(y,fills,tol=4):
+    for f in fills:
+        if f["top"]-tol<=y<=f["bottom"]+tol: return f["kind"]
+    return None
 
-# ── Image extraction ───────────────────────────────────────────────────────────
-def extract_images_from_pdf(pdf_path):
-    """Extract all embedded images using pdfimages (poppler). Returns sorted file list."""
-    subprocess.run(
-        ["pdfimages", "-all", pdf_path, os.path.join(IMG_DIR, "img")],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    files = sorted([
-        os.path.join(IMG_DIR, f) for f in os.listdir(IMG_DIR)
-        if re.match(r"img-\d+", f)
-    ])
-    return files
+# ── core line writer ──────────────────────────────────────────────────────────
+def write_line(ws,xl_row,segs,slots,n_slots,fk):
+    if not segs: rh(ws,xl_row,5); return 1
+    sz=segs[0]["size"] if segs else 9
 
-# ── Main conversion ────────────────────────────────────────────────────────────
-def convert(pdf_path, output_path):
-    print(f"Converting: {pdf_path}")
+    if fk=="black":
+        txt="  "+"  ".join(s["text"] for s in segs)
+        c=ws.cell(xl_row,1); wc(c,txt,bold=True,sz=max(int(sz),9),color="FFFFFF",fill="1F1F1F")
+        rh(ws,xl_row,max(14,round(sz*1.6)))
+        if n_slots>1: mg(ws,xl_row,1,xl_row,n_slots)
+        return 1
 
-    # Extract all embedded images once (across whole PDF)
-    img_files = extract_images_from_pdf(pdf_path)
-    print(f"  → {len(img_files)} embedded image(s) found")
+    if fk=="grey":
+        used=set()
+        for si,seg in enumerate(segs):
+            cs=slot_of(seg["x0"],slots); ce=end_slot(si,segs,slots); col=cs+1
+            if col in used: continue
+            al=detect_align(seg,slots[cs],slots[min(cs+1,len(slots)-1)])
+            c=ws.cell(xl_row,col); wc(c,seg["text"],bold=True,sz=max(int(seg["size"]),8),fill="DCDCDC",align=al)
+            if ce>cs: mg(ws,xl_row,col,xl_row,ce+1); [used.add(x) for x in range(col,ce+2)]
+            else: used.add(col)
+        rh(ws,xl_row,13); return 1
 
-    # Render page thumbnails for reference (not placed in Excel)
-    page_renders = convert_from_path(pdf_path, dpi=150)
+    rh(ws,xl_row,max(11,round(sz*1.65)))
+    su=defaultdict(set); pl=[]
+    for si,seg in enumerate(segs):
+        cs=slot_of(seg["x0"],slots); ce=end_slot(si,segs,slots); sub=0
+        while any((cs+1+k) in su[sub] for k in range(ce-cs+1)): sub+=1
+        pl.append((sub,cs,ce,seg))
+        for k in range(ce-cs+1): su[sub].add(cs+1+k)
+    ns=max(p[0] for p in pl)+1
+    for sub,cs,ce,seg in pl:
+        row=xl_row+sub
+        al=detect_align(seg,slots[cs],slots[min(cs+1,len(slots)-1)])
+        c=ws.cell(row,cs+1); wc(c,seg["text"],bold=seg["bold"],sz=max(int(seg["size"]),8),align=al)
+        rh(ws,row,max(11,round(sz*1.65)))
+        if ce>cs: mg(ws,row,cs+1,row,ce+1)
+    return ns
 
-    wb = Workbook()
-    global_img_idx = 0  # pointer into img_files across all pages
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODE 1 — GRID
+# ══════════════════════════════════════════════════════════════════════════════
+def write_grid(ws,page):
+    slots=vline_slots(page); n=max(len(slots)-1,1)
+    fills=get_fills(page); vis=get_rows(page.chars)
+    all_segs=[get_segs(chs) for _,chs in vis]
+    set_cws(ws,slots)
+    xl=1
+    for li,(_,__) in enumerate(vis):
+        segs=all_segs[li]; fk=fill_at(vis[li][0],fills)
+        if not segs: rh(ws,xl,5); xl+=1; continue
+        xl+=write_line(ws,xl,segs,slots,n,fk)
 
-    with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages):
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODE 2 — TABLE
+# ══════════════════════════════════════════════════════════════════════════════
+def write_table(ws,page,tables):
+    pw=float(page.width); fills=get_fills(page)
+    vis=get_rows(page.chars); all_segs=[get_segs(chs) for _,chs in vis]
+    spans=[(t.bbox[1],t.bbox[3],t) for t in tables]
 
-            # ── Sheet setup ───────────────────────────────────────────────────
-            ws = wb.active if page_num == 0 else wb.create_sheet()
-            ws.title = f"Page {page_num + 1}"
-            ws.sheet_view.showGridLines = True
+    def in_tbl(y):
+        for tp,bt,_ in spans:
+            if tp-5<=y<=bt+5: return True
+        return False
 
-            page_w = float(page.width)
-            page_h = float(page.height)
-
-            # Set uniform column widths
-            col_w = 11
-            for c in range(1, EXCEL_COLS + 2):
-                ws.column_dimensions[get_column_letter(c)].width = col_w
-
-            current_row = 1  # tracks next free Excel row
-
-            # ── Collect table bounding boxes ──────────────────────────────────
-            tbl_objects = page.find_tables()
-            table_bboxes = [tuple(t.bbox) for t in tbl_objects]  # (x0,top,x1,bot)
-
-            # ── Group non-table words into lines keyed by rounded y ───────────
-            words = page.extract_words(
-                keep_blank_chars=True, x_tolerance=3, y_tolerance=3
-            )
-            line_map = defaultdict(list)
-            for w in words:
-                y = float(w["top"])
-                if not in_any_table(y, table_bboxes):
-                    y_key = round(y / 4) * 4   # 4-pt bucket
-                    line_map[y_key].append(w)
-
-            # ── Build event list: (pdf_y, type, data) ─────────────────────────
-            events = []
-            for y_key, wds in line_map.items():
-                events.append((y_key, "text", wds))
-            for ti, tbl_obj in enumerate(tbl_objects):
-                events.append((tbl_obj.bbox[1], "table", (ti, tbl_obj)))
-            for ii, img_meta in enumerate(page.images):
-                events.append((float(img_meta.get("top", 0)), "image", (ii, img_meta)))
-
-            events.sort(key=lambda e: e[0])
-
-            written_tables = set()
-            written_images = set()
-
-            for pdf_y, etype, edata in events:
-
-                # ════════════════════════════════════════════════════════════
-                # TEXT LINE
-                # ════════════════════════════════════════════════════════════
-                if etype == "text":
-                    wds = sorted(edata, key=lambda w: float(w["x0"]))
-                    line_text = " ".join(w["text"] for w in wds).strip()
-                    if not line_text:
-                        continue
-
-                    # Detect alignment
-                    alignment = detect_alignment(wds, page_w)
-
-                    # Detect font size → classify as title / heading / body
-                    avg_size = font_size_of_words(wds)
-                    is_title   = avg_size >= 16
-                    is_heading = 11 <= avg_size < 16
-
-                    # Write merged cell across all columns
-                    cell = ws.cell(row=current_row, column=1, value=line_text)
-                    ws.merge_cells(
-                        start_row=current_row, start_column=1,
-                        end_row=current_row, end_column=EXCEL_COLS
-                    )
-
-                    # Alignment mapping
-                    xl_align = {"left": "left", "center": "center", "right": "right"}[alignment]
-
-                    if is_title:
-                        cell.font      = Font(name="Arial", bold=True, size=16, color=C_TITLE_FG)
-                        cell.fill      = solid(C_TITLE_BG)
-                        cell.alignment = Alignment(horizontal=xl_align, vertical="center", wrap_text=True)
-                        ws.row_dimensions[current_row].height = 32
-                    elif is_heading:
-                        cell.font      = Font(name="Arial", bold=True, size=12, color=C_HEADING_FG)
-                        cell.alignment = Alignment(horizontal=xl_align, vertical="center", wrap_text=True)
-                        ws.row_dimensions[current_row].height = 22
+    xl=1; done=set()
+    for li,(y,_) in enumerate(vis):
+        for ti,(tp,bt,t) in enumerate(spans):
+            if ti not in done and abs(y-tp)<12:
+                done.add(ti)
+                data=t.extract()
+                if not data: continue
+                nc=max((len(r) for r in data if r),default=1)
+                tw=t.bbox[2]-t.bbox[0]
+                for ci in range(nc):
+                    ltr=get_column_letter(ci+1)
+                    cw=max(4,round((tw/nc)/5.5))
+                    if ws.column_dimensions[ltr].width<cw:
+                        ws.column_dimensions[ltr].width=cw
+                hdr=True
+                for trow in data:
+                    if trow is None: xl+=1; continue
+                    cells=[str(v).strip() if v is not None else "" for v in trow]
+                    if all(c=="" for c in cells): xl+=1; continue
+                    rh(ws,xl,14)
+                    if hdr:
+                        for ci,val in enumerate(cells):
+                            c=ws.cell(xl,ci+1); wc(c,val,bold=True,sz=9,align="center",fill="BDD7EE")
+                        hdr=False
                     else:
-                        cell.font      = Font(name="Arial", size=10, color="333333")
-                        cell.alignment = Alignment(horizontal=xl_align, vertical="center", wrap_text=True)
-                        ws.row_dimensions[current_row].height = ROW_HEIGHT
+                        for ci,val in enumerate(cells):
+                            is_num=bool(re.match(r'^-?[\d,]+\.?\d*$',val.replace(" ","")))
+                            c=ws.cell(xl,ci+1); wc(c,val,sz=9,align="right" if is_num else "left")
+                    xl+=1
+                continue
+        if in_tbl(y): continue
+        segs=all_segs[li]; fk=fill_at(y,fills); sz=segs[0]["size"] if segs else 9
+        if not segs: xl+=1; continue
+        rh(ws,xl,max(11,round(sz*1.6)))
+        if fk=="black":
+            c=ws.cell(xl,1); wc(c,"  "+"  ".join(s["text"] for s in segs),bold=True,sz=max(int(sz),9),color="FFFFFF",fill="1F1F1F"); rh(ws,xl,14)
+        elif fk=="grey":
+            for ci2,seg in enumerate(segs): c=ws.cell(xl,ci2+1); wc(c,seg["text"],bold=True,sz=8,fill="DCDCDC")
+        else:
+            nz=max(2,round(pw/150))
+            for seg in segs:
+                col=max(1,round(seg["x0"]/(pw/nz)))
+                c=ws.cell(xl,col)
+                while c.value: col+=1; c=ws.cell(xl,col)
+                wc(c,seg["text"],bold=seg["bold"],sz=max(int(seg["size"]),8),
+                   align="right" if seg["x0"]>pw*0.55 else "left",border=False)
+        xl+=1
 
-                    current_row += 1
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODE 3 — TEXT
+# ══════════════════════════════════════════════════════════════════════════════
+def write_text(ws,page):
+    pw=float(page.width); fills=get_fills(page)
+    vis=get_rows(page.chars); all_segs=[get_segs(chs) for _,chs in vis]
+    slots=text_slots(all_segs,pw); n=max(len(slots)-1,1)
+    set_cws(ws,slots)
+    xl=1
+    for li,(y,_) in enumerate(vis):
+        segs=all_segs[li]; fk=fill_at(y,fills)
+        if not segs: rh(ws,xl,5); xl+=1; continue
+        xl+=write_line(ws,xl,segs,slots,n,fk)
 
-                # ════════════════════════════════════════════════════════════
-                # TABLE
-                # ════════════════════════════════════════════════════════════
-                elif etype == "table":
-                    ti, tbl_obj = edata
-                    if ti in written_tables:
-                        continue
-                    written_tables.add(ti)
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE DISPATCHER
+# ══════════════════════════════════════════════════════════════════════════════
+def process_page(ws,page):
+    vlines=[l for l in page.lines if abs(l["x0"]-l["x1"])<1.5 and abs(l["y0"]-l["y1"])>LINE_MIN]
+    good=[t for t in page.find_tables()
+          if t.extract() and max((len(r) for r in t.extract() if r),default=0)>=TABLE_COLS]
+    if len(vlines)>=VLINE_MIN:
+        write_grid(ws,page); return "GRID"
+    elif good:
+        write_table(ws,page,good); return "TABLE"
+    else:
+        write_text(ws,page); return "TEXT"
 
-                    tbl_data = tbl_obj.extract()
-                    if not tbl_data:
-                        continue
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONVERT
+# ══════════════════════════════════════════════════════════════════════════════
+def convert(pdf_path:str, out_path:str=None)->str:
+    if out_path is None:
+        out_path=os.path.splitext(pdf_path)[0]+".xlsx"
+    print(f"\n{'═'*58}\n  PDF → Excel  (dynamic — any PDF)\n  In : {os.path.basename(pdf_path)}\n  Out: {out_path}\n{'═'*58}")
+    wb=Workbook()
+    with pdfplumber.open(pdf_path) as pdf:
+        n=len(pdf.pages)
+        for pn,page in enumerate(pdf.pages):
+            ws=wb.active if pn==0 else wb.create_sheet()
+            ws.title=f"Page {pn+1}"
+            nv=len([l for l in page.lines if abs(l["x0"]-l["x1"])<1.5 and abs(l["y0"]-l["y1"])>LINE_MIN])
+            print(f"  Page {pn+1}/{n} ({page.width:.0f}x{page.height:.0f} chars={len(page.chars)} vlines={nv})",end="  ",flush=True)
+            mode=process_page(ws,page)
+            ws.freeze_panes="A2"
+            print(f"[{mode}] ✓")
+    wb.save(out_path)
+    print(f"\n  ✓  {n} page(s) → {out_path}\n")
+    return out_path
 
-                    current_row += 1  # gap before table
-
-                    num_cols = max(len(r) for r in tbl_data)
-
-                    for r_i, row in enumerate(tbl_data):
-                        is_header = (r_i == 0)
-                        is_total  = (r_i == len(tbl_data) - 1)
-
-                        for c_i in range(num_cols):
-                            val = row[c_i] if c_i < len(row) else ""
-                            cell = ws.cell(
-                                row=current_row, column=c_i + 1,
-                                value=str(val).strip() if val else ""
-                            )
-
-                            if is_header:
-                                cell.font      = Font(name="Arial", bold=True, size=10, color=C_HEADER_FG)
-                                cell.fill      = solid(C_HEADER_BG)
-                                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                                cell.border    = cell_border(top=MED, bottom=MED, left=MED, right=MED)
-                            elif is_total:
-                                cell.font      = Font(name="Arial", bold=True, size=10, color=C_TOTAL_FG)
-                                cell.fill      = solid(C_TOTAL_BG)
-                                cell.alignment = Alignment(horizontal="center", vertical="center")
-                                cell.border    = cell_border(top=MED, bottom=MED, left=MED, right=MED)
-                            else:
-                                bg = C_ROW_EVEN if r_i % 2 == 0 else C_ROW_ODD
-                                cell.font      = Font(name="Arial", size=10, color="1A1A1A")
-                                cell.fill      = solid(bg)
-                                cell.alignment = Alignment(horizontal="center", vertical="center")
-                                cell.border    = cell_border()
-
-                        ws.row_dimensions[current_row].height = 20
-                        current_row += 1
-
-                    current_row += 1  # gap after table
-
-                # ════════════════════════════════════════════════════════════
-                # IMAGE
-                # ════════════════════════════════════════════════════════════
-                elif etype == "image":
-                    ii, img_meta = edata
-                    if ii in written_images:
-                        continue
-                    written_images.add(ii)
-
-                    if global_img_idx >= len(img_files):
-                        continue
-
-                    img_path = img_files[global_img_idx]
-                    global_img_idx += 1
-
-                    if not os.path.exists(img_path):
-                        continue
-
-                    try:
-                        pil_img = PILImage.open(img_path).convert("RGBA")
-
-                        # Original PDF coords
-                        pdf_top   = float(img_meta.get("top",    0))
-                        pdf_left  = float(img_meta.get("x0",     0))
-                        pdf_bot   = float(img_meta.get("bottom", page_h))
-                        pdf_right = float(img_meta.get("x1",     page_w))
-
-                        img_w_pts = pdf_right - pdf_left
-                        img_h_pts = pdf_bot   - pdf_top
-
-                        # Map PDF width/height (in pts) → pixels
-                        # A4 ≈ 595 pts wide; render at 150 dpi → 595/72*150 ≈ 1240px
-                        scale = 150 / 72  # dpi / pts_per_inch
-                        target_px_w = int(img_w_pts * scale)
-                        target_px_h = int(img_h_pts * scale)
-                        target_px_w = max(target_px_w, 40)
-                        target_px_h = max(target_px_h, 20)
-
-                        pil_img = pil_img.resize(
-                            (target_px_w, target_px_h), PILImage.LANCZOS
-                        )
-
-                        # Convert RGBA → RGB for JPEG-safe output
-                        bg = PILImage.new("RGB", pil_img.size, (255, 255, 255))
-                        bg.paste(pil_img, mask=pil_img.split()[3] if pil_img.mode == "RGBA" else None)
-                        pil_img = bg
-
-                        buf = io.BytesIO()
-                        pil_img.save(buf, format="PNG")
-                        buf.seek(0)
-
-                        xl_img        = XLImage(buf)
-                        xl_img.width  = target_px_w
-                        xl_img.height = target_px_h
-
-                        # Accurate anchor: map PDF (top, left) → Excel (row, col)
-                        anchor_row = max(1, int((pdf_top  / page_h) * current_row) + 1)
-                        anchor_col = max(1, int((pdf_left / page_w) * EXCEL_COLS)  + 1)
-
-                        anchor_cell = f"{get_column_letter(anchor_col)}{anchor_row}"
-                        ws.add_image(xl_img, anchor_cell)
-
-                        # Ensure enough rows exist below anchor for the image
-                        rows_needed = int(target_px_h / ROW_HEIGHT) + 1
-                        end_row = anchor_row + rows_needed
-                        while current_row < end_row:
-                            ws.row_dimensions[current_row].height = ROW_HEIGHT
-                            current_row += 1
-
-                        print(f"  [Page {page_num+1}] Image {ii+1} → anchor {anchor_cell} "
-                              f"({target_px_w}×{target_px_h}px, "
-                              f"PDF pos top={pdf_top:.0f} left={pdf_left:.0f})")
-
-                    except Exception as exc:
-                        print(f"  [Page {page_num+1}] Image {ii+1} skipped: {exc}")
-
-    wb.save(output_path)
-    print(f"\n✓ Saved → {output_path}")
-
-
-# ── Entry point ────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python pdf_to_excel.py  input.pdf  output.xlsx")
-        sys.exit(1)
-    convert(sys.argv[1], sys.argv[2])
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLI
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__=="__main__":
+    if len(sys.argv)<2:
+        print("Usage: python pdf_to_excel.py  input.pdf  [output.xlsx]")
+        print("       python pdf_to_excel.py  *.pdf")
+        sys.exit(0)
+    inputs=[]; out=None
+    for arg in sys.argv[1:]:
+        if arg.lower().endswith(".xlsx"): out=arg
+        else:
+            exp=glob.glob(arg)
+            if exp: inputs.extend(sorted(exp))
+            elif os.path.exists(arg): inputs.append(arg)
+            else: print(f"  Not found: {arg}")
+    if not inputs: print("No PDF files."); sys.exit(1)
+    if len(inputs)>1: out=None
+    ok=fail=0
+    for p in inputs:
+        try: convert(p,out if len(inputs)==1 else None); ok+=1
+        except Exception as e:
+            print(f"  ERROR {p}: {e}"); import traceback; traceback.print_exc(); fail+=1
+    if len(inputs)>1: print(f"\n  Done: {ok} ok, {fail} failed.")
